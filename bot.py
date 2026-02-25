@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from telethon import TelegramClient
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
@@ -15,17 +16,18 @@ BOT_TOKEN = "8559985318:AAHJdshGOYv1hQMEM6kpOFFJzL1lX9OnCGw"
 ADMIN_ID = 174415647
 # ========================
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Словарь для хранения TelegramClient на время сессии
 user_clients = {}
 
 
 async def get_group_members(client, group_link):
     """Получить всех участников группы"""
     try:
-        # Преобразуем ссылку в username
         if "t.me/" in group_link:
             group_name = group_link.split("t.me/")[-1].rstrip("/")
         else:
@@ -74,6 +76,8 @@ async def get_group_members(client, group_link):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Команда /start"""
+    logger.info(f"Получена команда /start от {message.from_user.id}")
+    
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ У тебя нет доступа к этому боту")
         return
@@ -86,8 +90,10 @@ async def cmd_start(message: Message):
 
 
 @dp.message()
-async def parse_group(message: Message):
-    """Парсим группу по ссылке"""
+async def handle_message(message: Message):
+    """Обработка всех остальных сообщений"""
+    logger.info(f"Получено сообщение: {message.text} от {message.from_user.id}")
+    
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ У тебя нет доступа")
         return
@@ -98,10 +104,13 @@ async def parse_group(message: Message):
         await message.answer("❌ Отправь ссылку на группу")
         return
     
+    # Игнорируем команды (обработает Command фильтр)
+    if group_link.startswith("/"):
+        return
+    
     await message.answer(f"⏳ Подключаюсь к группе: {group_link}")
     
     try:
-        # Создаём клиент для этого пользователя если его нет
         if message.from_user.id not in user_clients:
             client = TelegramClient(f"session_{message.from_user.id}", API_ID, API_HASH)
             await client.connect()
@@ -112,7 +121,6 @@ async def parse_group(message: Message):
         else:
             client = user_clients[message.from_user.id]
         
-        # Парсим группу
         members, group_title = await get_group_members(client, group_link)
         
         if members is None:
@@ -122,21 +130,20 @@ async def parse_group(message: Message):
         await message.answer(f"✅ Найдено {len(members)} участников в группе '{group_title}'\n\n"
                            f"Начинаю отправлять...")
         
-        # Отправляем каждого юзера отдельно
         for i, user in enumerate(members, 1):
             text = f"#{i}\n🆔 ID: {user['id']}\n👤 {user['username']}"
             await message.answer(text)
-            await asyncio.sleep(0.1)  # Небольшая задержка между сообщениями
+            await asyncio.sleep(0.1)
         
         await message.answer(f"✅ Готово! Отправлено {len(members)} участников")
         
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
-        print(f"Ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
 
 
 async def main():
-    print("🤖 Бот запущен...")
+    logger.info("🤖 Бот запущен...")
     try:
         await dp.start_polling(bot)
     finally:
