@@ -38,7 +38,7 @@ class Auth(StatesGroup):
 
 # ===================== HELPERS =====================
 async def get_group_members(client: TelegramClient, group_link: str, status_msg=None):
-    """Получить участников группы всеми методами включая историю сообщений"""
+    """Быстрый парсинг — параллельные запросы + история сообщений"""
     try:
         if "t.me/" in group_link:
             group_name = group_link.split("t.me/")[-1].rstrip("/").lstrip("+")
@@ -46,17 +46,20 @@ async def get_group_members(client: TelegramClient, group_link: str, status_msg=
             group_name = group_link
 
         entity = await client.get_entity(group_name)
-        members_dict = {}  # id -> user dict
+        members_dict = {}
+        lock = asyncio.Lock()
 
         async def add_user(user):
-            if user and not user.bot and user.id not in members_dict:
-                members_dict[user.id] = {
-                    "id": user.id,
-                    "username": f"@{user.username}" if user.username else "нет username",
-                    "name": f"{user.first_name or ''} {user.last_name or ''}".strip()
-                }
+            if user and not user.bot:
+                async with lock:
+                    if user.id not in members_dict:
+                        members_dict[user.id] = {
+                            "id": user.id,
+                            "username": f"@{user.username}" if user.username else "нет username",
+                            "name": f"{user.first_name or ''} {user.last_name or ''}".strip()
+                        }
 
-        # ── Метод 1: стандартный GetParticipants ──
+        # ── Метод 1: стандартный список ──
         try:
             offset = 0
             while True:
@@ -72,85 +75,117 @@ async def get_group_members(client: TelegramClient, group_link: str, status_msg=
                 offset += len(result.users)
                 if offset >= result.count:
                     break
-                await asyncio.sleep(0.3)
         except Exception:
             pass
 
-        # ── Метод 2: перебор по символам ──
-        chars = list("abcdefghijklmnopqrstuvwxyz0123456789_")
-        double_chars = [a + b for a in "abcdefghijklmnopqrstuvwxyz" for b in "abcdefghijklmnopqrstuvwxyz0123456789_"]
-        all_queries = chars + double_chars
-        total_q = len(all_queries)
-
-        for i, query in enumerate(all_queries):
+        if status_msg:
             try:
-                result = await client(GetParticipantsRequest(
-                    channel=entity,
-                    filter=ChannelParticipantsSearch(query),
-                    offset=0, limit=200, hash=0
-                ))
-                for user in result.users:
-                    await add_user(user)
-
-                if status_msg and i % 10 == 0:
-                    percent = int(i / total_q * 50)  # первые 50% прогресса
-                    try:
-                        await status_msg.edit_text(
-                            f"⏳ Метод 1/2: перебор символов... {percent}%\n"
-                            f"🔍 Запросов: {i}/{total_q}\n"
-                            f"👥 Найдено: {len(members_dict)}"
-                        )
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.35)
+                await status_msg.edit_text(
+                    f"⚡️ Метод 1 готов\n👥 Найдено: {len(members_dict)}\n🔍 Запускаю перебор символов...")
             except Exception:
-                await asyncio.sleep(1)
-                continue
+                pass
 
-        # ── Метод 3: парсинг истории сообщений ──
-        # Находит всех кто когда-либо писал в чат — даже скрытых участников
-        try:
-            if status_msg:
+        # ── Метод 2: параллельный перебор символов ──
+        # Только одиночные символы — быстро и эффективно
+        chars = list("abcdefghijklmnopqrstuvwxyz0123456789_")
+        semaphore = asyncio.Semaphore(5)  # 5 параллельных запросов
+
+        async def fetch_by_char(char):
+            async with semaphore:
+                try:
+                    result = await client(GetParticipantsRequest(
+                        channel=entity,
+                        filter=ChannelParticipantsSearch(char),
+                        offset=0, limit=200, hash=0
+                    ))
+                    for user in result.users:
+                        await add_user(user)
+                    # Если вернуло 200 — есть ещё, берём следующую страницу
+                    if len(result.users) == 200:
+                        offset = 200
+                        while True:
+                            r2 = await client(GetParticipantsRequest(
+                                channel=entity,
+                                filter=ChannelParticipantsSearch(char),
+                                offset=offset, limit=200, hash=0
+                            ))
+                            if not r2.users:
+                                break
+                            for user in r2.users:
+                                await add_user(user)
+                            offset += len(r2.users)
+                            if offset >= r2.count:
+                                break
+                            await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)
+                except Exception:
+                    await asyncio.sleep(0.5)
+
+        # Запускаем батчами по 5
+        batch_size = 5
+        for i in range(0, len(chars), batch_size):
+            batch = chars[i:i + batch_size]
+            await asyncio.gather(*[fetch_by_char(c) for c in batch])
+            if status_msg and i % 10 == 0:
                 try:
                     await status_msg.edit_text(
-                        f"⏳ Метод 2/2: читаю историю сообщений...\n"
-                        f"👥 Найдено до этого: {len(members_dict)}\n"
-                        f"📜 Это займёт ещё немного времени..."
+                        f"⚡️ Перебор символов: {i}/{len(chars)}\n"
+                        f"👥 Найдено: {len(members_dict)}"
                     )
                 except Exception:
                     pass
 
-            msg_count = 0
-            async for msg in client.iter_messages(entity, limit=None):
-                if msg.from_id is not None:
-                    try:
-                        user = await client.get_entity(msg.from_id)
-                        await add_user(user)
-                    except Exception:
-                        pass
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"⚡️ Символы готовы\n👥 Найдено: {len(members_dict)}\n📜 Читаю историю сообщений...")
+            except Exception:
+                pass
 
+        # ── Метод 3: история сообщений (параллельное получение юзеров) ──
+        try:
+            msg_count = 0
+            user_ids_to_fetch = set()
+
+            # Сначала быстро собираем все from_id из сообщений
+            async for msg in client.iter_messages(entity, limit=5000):
+                if msg.sender_id and msg.sender_id not in members_dict:
+                    user_ids_to_fetch.add(msg.sender_id)
                 msg_count += 1
-                # Обновляем статус каждые 500 сообщений
-                if status_msg and msg_count % 500 == 0:
+                if msg_count % 1000 == 0 and status_msg:
                     try:
                         await status_msg.edit_text(
-                            f"⏳ Читаю историю сообщений...\n"
-                            f"📜 Обработано сообщений: {msg_count}\n"
-                            f"👥 Найдено уникальных: {len(members_dict)}"
+                            f"📜 Читаю историю: {msg_count} сообщений\n"
+                            f"👥 Найдено: {len(members_dict)}"
                         )
                     except Exception:
                         pass
-                await asyncio.sleep(0.05)
+
+            # Потом батчами получаем юзеров
+            uid_list = list(user_ids_to_fetch)
+            fetch_sem = asyncio.Semaphore(10)
+
+            async def fetch_user(uid):
+                async with fetch_sem:
+                    try:
+                        user = await client.get_entity(uid)
+                        await add_user(user)
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        pass
+
+            for i in range(0, len(uid_list), 20):
+                batch = uid_list[i:i + 20]
+                await asyncio.gather(*[fetch_user(uid) for uid in batch])
 
         except Exception as e:
             logger.warning(f"История недоступна: {e}")
 
-        # Финальное обновление
+        # Финал
         if status_msg:
             try:
                 await status_msg.edit_text(
-                    f"✅ Готово!\n"
-                    f"👥 Итого найдено: {len(members_dict)}"
+                    f"✅ Парсинг завершён!\n👥 Итого: {len(members_dict)}"
                 )
             except Exception:
                 pass
