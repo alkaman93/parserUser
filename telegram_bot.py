@@ -2,8 +2,9 @@ import asyncio
 import logging
 from telethon import TelegramClient
 from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.tl.types import ChannelParticipantsSearch
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, UserAlreadyParticipantError, InviteHashExpiredError
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -40,12 +41,7 @@ class Auth(StatesGroup):
 async def get_group_members(client: TelegramClient, group_link: str, status_msg=None):
     """Быстрый парсинг — параллельные запросы + история сообщений"""
     try:
-        if "t.me/" in group_link:
-            group_name = group_link.split("t.me/")[-1].rstrip("/").lstrip("+")
-        else:
-            group_name = group_link
-
-        entity = await client.get_entity(group_name)
+        entity, just_joined = await resolve_entity(client, group_link)
         members_dict = {}
         lock = asyncio.Lock()
 
@@ -194,6 +190,57 @@ async def get_group_members(client: TelegramClient, group_link: str, status_msg=
 
     except Exception as e:
         return None, str(e)
+
+
+async def resolve_entity(client: TelegramClient, group_link: str):
+    """Получить entity группы — поддержка публичных и приватных ссылок"""
+    link = group_link.strip()
+
+    # Извлекаем хэш из приватной ссылки вида https://t.me/+HASH или https://t.me/joinchat/HASH
+    invite_hash = None
+    if "+joinchat/" in link:
+        invite_hash = link.split("+joinchat/")[-1].rstrip("/")
+    elif "t.me/+" in link:
+        invite_hash = link.split("t.me/+")[-1].rstrip("/")
+    elif "t.me/joinchat/" in link:
+        invite_hash = link.split("t.me/joinchat/")[-1].rstrip("/")
+
+    if invite_hash:
+        # Приватная ссылка — пробуем вступить
+        try:
+            result = await client(ImportChatInviteRequest(invite_hash))
+            if hasattr(result, 'chats') and result.chats:
+                return result.chats[0], True
+        except UserAlreadyParticipantError:
+            # Уже состоим — получаем entity через CheckChatInviteRequest
+            try:
+                check = await client(CheckChatInviteRequest(invite_hash))
+                # chat есть в разных полях в зависимости от типа
+                chat = getattr(check, 'chat', None)
+                if chat:
+                    return chat, False
+                # Альтернатива — получить через get_entity по id если чат вернулся
+            except Exception:
+                pass
+            # Последний вариант — пробуем напрямую получить по хэшу
+            try:
+                entity = await client.get_entity(f"https://t.me/+{invite_hash}")
+                return entity, False
+            except Exception:
+                pass
+            raise Exception("❌ Уже в группе, но не удалось получить entity. Попробуй переслать любое сообщение из группы боту.")
+        except InviteHashExpiredError:
+            raise Exception("❌ Ссылка-приглашение устарела или недействительна")
+        except Exception as e:
+            raise Exception(f"❌ Не удалось вступить по ссылке: {e}")
+
+    # Публичная группа
+    if "t.me/" in link:
+        group_name = link.split("t.me/")[-1].rstrip("/")
+    else:
+        group_name = link
+
+    return await client.get_entity(group_name), False
 
 
 async def get_or_create_client(uid: int) -> TelegramClient:
@@ -359,12 +406,24 @@ async def handle_group_link(message: Message, state: FSMContext):
         return
 
     await message.answer(
-        f"⏳ Парсю группу: <code>{group_link}</code>\n\n"
-        f"🔍 Перебираю все комбинации символов для поиска скрытых участников...\n"
-        f"⏱ Это может занять 2-5 минут, подожди.",
+        f"⏳ Подключаюсь к группе: <code>{group_link}</code>...",
         parse_mode="HTML"
     )
-    status_msg = await message.answer("⏳ Парсинг... 0%\n🔍 Запросов: 0/0\n👥 Найдено: 0")
+
+    try:
+        # Пробуем вступить если приватная ссылка
+        entity, just_joined = await resolve_entity(client, group_link)
+        if just_joined:
+            await message.answer(f"✅ Вступил в группу: <b>{entity.title}</b>", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ {str(e)}")
+        return
+
+    await message.answer(
+        f"🔍 Перебираю участников...\n⏱ Подожди 2-3 минуты.",
+        parse_mode="HTML"
+    )
+    status_msg = await message.answer("⏳ Парсинг запущен...\n👥 Найдено: 0")
 
     members, group_title = await get_group_members(client, group_link, status_msg)
 
@@ -378,7 +437,7 @@ async def handle_group_link(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-    # Отправляем порциями по 50 в одном сообщении чтобы не спамить
+    # Отправляем порциями по 50 в одном сообщении
     chunk_size = 50
     for i in range(0, len(members), chunk_size):
         chunk = members[i:i + chunk_size]
