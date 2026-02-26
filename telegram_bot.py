@@ -79,8 +79,8 @@ async def get_group_members(client: TelegramClient, group_link: str, status_msg=
                         break
                     await asyncio.sleep(0.3)
 
-                # Обновляем статус каждые 50 запросов
-                if status_msg and i % 50 == 0 and i > 0:
+                # Обновляем статус каждые 10 запросов
+                if status_msg and (i == 0 or i % 10 == 0):
                     percent = int(i / total * 100)
                     try:
                         await status_msg.edit_text(
@@ -96,6 +96,17 @@ async def get_group_members(client: TelegramClient, group_link: str, status_msg=
             except Exception:
                 await asyncio.sleep(1)
                 continue
+
+        # Финальное обновление статуса
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"✅ Парсинг завершён!\n"
+                    f"🔍 Запросов выполнено: {total}\n"
+                    f"👥 Итого найдено: {len(members_dict)}"
+                )
+            except Exception:
+                pass
 
         # Формируем итоговый список
         members = []
