@@ -152,14 +152,13 @@ async def auth_phone(message: Message, state: FSMContext):
 
     client = await get_or_create_client(message.from_user.id)
     try:
-        await client.send_code_request(phone)
-        await state.update_data(phone=phone)
+        result = await client.send_code_request(phone)
+        await state.update_data(phone=phone, phone_code_hash=result.phone_code_hash)
         await state.set_state(Auth.code)
         await message.answer(
             "📨 Код отправлен в Telegram!\n\n"
             "Введи код который пришёл в приложение Telegram.\n"
-            "Если код <code>12345</code> — вводи с пробелами: <code>1 2 3 4 5</code> "
-            "(чтобы Telegram не воспринял его как ссылку)",
+            "Пиши код слитно: <code>12345</code>",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -169,10 +168,10 @@ async def auth_phone(message: Message, state: FSMContext):
 
 @dp.message(Auth.code)
 async def auth_code(message: Message, state: FSMContext):
-    # Убираем пробелы из кода (пользователь мог ввести "1 2 3 4 5")
     code = message.text.strip().replace(" ", "")
     data = await state.get_data()
     phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
 
     client = user_clients.get(message.from_user.id)
     if not client:
@@ -181,7 +180,7 @@ async def auth_code(message: Message, state: FSMContext):
         return
 
     try:
-        await client.sign_in(phone, code)
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         me = await client.get_me()
         await state.clear()
         await message.answer(
@@ -194,7 +193,7 @@ async def auth_code(message: Message, state: FSMContext):
         await state.set_state(Auth.password)
         await message.answer("🔐 Включена двухфакторная аутентификация.\nВведи пароль:")
     except Exception as e:
-        await message.answer(f"❌ Неверный код или ошибка: {str(e)}\n\nПопробуй снова: /auth")
+        await message.answer(f"❌ Ошибка: {str(e)}\n\nПопробуй снова: /auth")
         await state.clear()
         logger.error(f"Ошибка sign_in: {e}")
 
