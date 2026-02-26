@@ -37,8 +37,8 @@ class Auth(StatesGroup):
 
 
 # ===================== HELPERS =====================
-async def get_group_members(client: TelegramClient, group_link: str):
-    """Получить всех участников группы"""
+async def get_group_members(client: TelegramClient, group_link: str, status_msg=None):
+    """Получить участников группы — перебор по символам и комбинациям"""
     try:
         if "t.me/" in group_link:
             group_name = group_link.split("t.me/")[-1].rstrip("/").lstrip("+")
@@ -46,36 +46,65 @@ async def get_group_members(client: TelegramClient, group_link: str):
             group_name = group_link
 
         entity = await client.get_entity(group_name)
+        members_dict = {}  # id -> user (дедупликация)
+
+        # Все символы для перебора
+        chars = list("abcdefghijklmnopqrstuvwxyz0123456789_.")
+        # Двойные комбинации для глубокого поиска (aa, ab, ... zz + цифры)
+        double_chars = [a + b for a in "abcdefghijklmnopqrstuvwxyz" for b in "abcdefghijklmnopqrstuvwxyz0123456789_"]
+
+        all_queries = [""] + chars + double_chars  # сначала пустой, потом одиночные, потом двойные
+        total = len(all_queries)
+
+        for i, query in enumerate(all_queries):
+            try:
+                offset = 0
+                while True:
+                    result = await client(GetParticipantsRequest(
+                        channel=entity,
+                        filter=ChannelParticipantsSearch(query),
+                        offset=offset,
+                        limit=200,
+                        hash=0
+                    ))
+                    if not result.users:
+                        break
+                    new_found = 0
+                    for user in result.users:
+                        if not user.bot and user.username and user.id not in members_dict:
+                            members_dict[user.id] = user
+                            new_found += 1
+                    offset += len(result.users)
+                    if offset >= result.count or new_found == 0:
+                        break
+                    await asyncio.sleep(0.3)
+
+                # Обновляем статус каждые 50 запросов
+                if status_msg and i % 50 == 0 and i > 0:
+                    percent = int(i / total * 100)
+                    try:
+                        await status_msg.edit_text(
+                            f"⏳ Парсинг... {percent}%\n"
+                            f"🔍 Запросов: {i}/{total}\n"
+                            f"👥 Найдено пока: {len(members_dict)}"
+                        )
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(0.35)
+
+            except Exception:
+                await asyncio.sleep(1)
+                continue
+
+        # Формируем итоговый список
         members = []
-        offset = 0
-        limit = 200
-
-        while True:
-            participants = await client(GetParticipantsRequest(
-                channel=entity,
-                filter=ChannelParticipantsSearch(""),
-                offset=offset,
-                limit=limit,
-                hash=0
-            ))
-
-            if not participants.users:
-                break
-
-            for user in participants.users:
-                if not user.bot:
-                    username = f"@{user.username}" if user.username else "нет username"
-                    members.append({
-                        "id": user.id,
-                        "username": username,
-                        "name": f"{user.first_name or ''} {user.last_name or ''}".strip()
-                    })
-
-            offset += len(participants.users)
-            if offset >= participants.count:
-                break
-
-            await asyncio.sleep(0.5)
+        for user in members_dict.values():
+            members.append({
+                "id": user.id,
+                "username": f"@{user.username}",
+                "name": f"{user.first_name or ''} {user.last_name or ''}".strip()
+            })
 
         return members, entity.title
 
@@ -245,9 +274,15 @@ async def handle_group_link(message: Message, state: FSMContext):
         )
         return
 
-    await message.answer(f"⏳ Парсю группу: <code>{group_link}</code>...", parse_mode="HTML")
+    await message.answer(
+        f"⏳ Парсю группу: <code>{group_link}</code>\n\n"
+        f"🔍 Перебираю все комбинации символов для поиска скрытых участников...\n"
+        f"⏱ Это может занять 2-5 минут, подожди.",
+        parse_mode="HTML"
+    )
+    status_msg = await message.answer("⏳ Парсинг... 0%\n🔍 Запросов: 0/0\n👥 Найдено: 0")
 
-    members, group_title = await get_group_members(client, group_link)
+    members, group_title = await get_group_members(client, group_link, status_msg)
 
     if members is None:
         await message.answer(f"❌ Ошибка: {group_title}")
